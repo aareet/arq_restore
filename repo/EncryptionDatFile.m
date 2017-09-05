@@ -60,52 +60,6 @@
 + (NSString *)errorDomain {
     return @"EncryptionDatFileErrorDomain";
 }
-+ (EncryptionDatFile *)createWithRandomMasterKeysAndEncryptionPassword:(NSString *)theEncryptionPassword
-                                                                target:(Target *)theTarget
-                                                          computerUUID:(NSString *)theComputerUUID
-                                                     encryptionVersion:(int)theEncryptionVersion
-                                              targetConnectionDelegate:(id <TargetConnectionDelegate>)theTCD
-                                                                 error:(NSError **)error {
-    // Generate a master encryption key.
-    NSMutableData *masterKeys = [NSMutableData dataWithLength:kCCKeySizeAES256 * 2];
-    unsigned char *masterKeysBytes = (unsigned char *)[masterKeys mutableBytes];
-    for (int i = 0; i < kCCKeySizeAES256 * 2; i++) {
-        masterKeysBytes[i] = (unsigned char)arc4random_uniform(256);
-    }
-    return [EncryptionDatFile createWithMasterKeys:masterKeys
-                                encryptionPassword:theEncryptionPassword
-                                            target:theTarget
-                                      computerUUID:theComputerUUID
-                                 encryptionVersion:theEncryptionVersion
-                          targetConnectionDelegate:theTCD
-                                             error:error];
-}
-
-+ (EncryptionDatFile *)createWithMasterKeys:(NSData *)theMasterKeys
-                         encryptionPassword:(NSString *)theEncryptionPassword
-                                     target:(Target *)theTarget
-                               computerUUID:(NSString *)theComputerUUID
-                          encryptionVersion:(int)theEncryptionVersion
-                   targetConnectionDelegate:(id <TargetConnectionDelegate>)theTCD
-                                      error:(NSError **)error {
-    NSData *data = [EncryptionDatFile generateDataWithMasterKeys:theMasterKeys encryptionPassword:theEncryptionPassword encryptionVersion:theEncryptionVersion error:error];
-    if (data == nil) {
-        return nil;
-    }
-    EncryptionDatFile *ret = [[[EncryptionDatFile alloc] initWithEncryptionPassword:theEncryptionPassword target:theTarget computerUUID:theComputerUUID encryptionVersion:theEncryptionVersion data:data masterKeys:theMasterKeys] autorelease];
-    // Delete the local cached file to avoid cache inconsistency in the event of an error when saving to target.
-    if (![ret deleteLocalCache:error]) {
-        return NO;
-    }
-    if (![ret saveToTargetWithTargetConnectionDelegate:theTCD error:error]) {
-        return NO;
-    }
-    NSError *cacheError = nil;
-    if (![ret saveToLocalCache:&cacheError]) {
-        HSLogError(@"failed to save new EncryptionDatFile to local cache: %@", cacheError);
-    }
-    return ret;
-}
 
 + (EncryptionDatFile *)encryptionDatFileForTarget:(Target *)theTarget
                                      computerUUID:(NSString *)theComputerUUID
@@ -114,12 +68,24 @@
                                             error:(NSError **)error {
     NSError *myError = nil;
     
-    // Try to read local v2 file.
+    // Try to read local v3 file.
     EncryptionDatFile *datFile = [[[EncryptionDatFile alloc] initFromLocalCacheWithEncryptionPassword:theEncryptionPassword
                                                                                                target:theTarget
                                                                                          computerUUID:theComputerUUID
-                                                                                    encryptionVersion:2
+                                                                                    encryptionVersion:3
                                                                                                 error:&myError] autorelease];
+    if (datFile == nil) {
+        if ([myError code] != ERROR_NOT_FOUND) {
+            SETERRORFROMMYERROR;
+            return nil;
+        }
+        // Try to read local v2 file.
+        datFile = [[[EncryptionDatFile alloc] initFromLocalCacheWithEncryptionPassword:theEncryptionPassword
+                                                                                target:theTarget
+                                                                          computerUUID:theComputerUUID
+                                                                     encryptionVersion:2
+                                                                                 error:&myError] autorelease];
+    }
     if (datFile == nil) {
         if ([myError code] != ERROR_NOT_FOUND) {
             SETERRORFROMMYERROR;
@@ -131,6 +97,25 @@
                                                                           computerUUID:theComputerUUID
                                                                      encryptionVersion:1
                                                                                  error:&myError] autorelease];
+    }
+    if (datFile == nil) {
+        if ([myError code] != ERROR_NOT_FOUND) {
+            SETERRORFROMMYERROR;
+            return nil;
+        }
+        // Try to read v3 file from target.
+        datFile = [[[EncryptionDatFile alloc] initFromTargetWithEncryptionPassword:theEncryptionPassword
+                                                                            target:theTarget
+                                                                      computerUUID:theComputerUUID
+                                                                 encryptionVersion:3
+                                                          targetConnectionDelegate:theTCD
+                                                                             error:&myError] autorelease];
+        if (datFile != nil) {
+            NSError *cacheError = nil;
+            if (![datFile saveToLocalCache:&cacheError]) {
+                HSLogError(@"failed to save encryption dat file to local cache: %@", cacheError);
+            }
+        }
     }
     if (datFile == nil) {
         if ([myError code] != ERROR_NOT_FOUND) {
@@ -312,66 +297,6 @@
     return self;
 }
 
-+ (NSData *)generateDataWithMasterKeys:(NSData *)theMasterKeys encryptionPassword:(NSString *)theEncryptionPassword encryptionVersion:(int)theEncryptionVersion error:(NSError **)error {
-    if ([theMasterKeys length] != 64 && theEncryptionVersion != 1) {
-        SETNSERROR([self errorDomain], -1, @"master key data must be 64 bytes");
-        return nil;
-    }
-    
-    // Create random salt.
-    NSData *salt = [NSData dataWithRandomBytesOfLength:SALT_LENGTH];
-    
-    // Create iv.
-    NSData *iv = [NSData dataWithRandomBytesOfLength:IV_LENGTH];
-    
-    // Derive 64-byte encryption key from theEncryptionPassword.
-    NSData *thePasswordData = [theEncryptionPassword dataUsingEncoding:NSUTF8StringEncoding];
-    void *derivedEncryptionKey = malloc(kCCKeySizeAES256 * 2);
-    CCKeyDerivationPBKDF(kCCPBKDF2, [thePasswordData bytes], [thePasswordData length], [salt bytes], [salt length], kCCPRFHmacAlgSHA1, KEY_DERIVATION_ROUNDS, derivedEncryptionKey, kCCKeySizeAES256 * 2);
-    void *derivedHMACKey = derivedEncryptionKey + kCCKeySizeAES256;
-
-    // Encrypt master keys using first 32 bytes of derived key and iv.
-    size_t encryptedMasterKeysLen = [theMasterKeys length] + kCCBlockSizeAES128;
-    NSMutableData *encryptedMasterKeys = [NSMutableData dataWithLength:encryptedMasterKeysLen];
-    size_t encryptedMasterKeysActualLen = 0;
-    CCCryptorStatus status = CCCrypt(kCCEncrypt,
-                                     kCCAlgorithmAES128,
-                                     kCCOptionPKCS7Padding,
-                                     derivedEncryptionKey,
-                                     kCCKeySizeAES256,
-                                     [iv bytes],
-                                     [theMasterKeys bytes],
-                                     [theMasterKeys length],
-                                     [encryptedMasterKeys mutableBytes],
-                                     [encryptedMasterKeys length],
-                                     &encryptedMasterKeysActualLen);
-    if (status != kCCSuccess) {
-        free(derivedEncryptionKey);
-        SETNSERROR([self errorDomain], -1, @"failed to encrypt master keys");
-        return nil;
-    }
-    [encryptedMasterKeys setLength:encryptedMasterKeysActualLen];
-    
-    // Calculate HMACSHA256 of IV + encrypted master keys, using derivedHMACKey.
-    unsigned char hmacSHA256[CC_SHA256_DIGEST_LENGTH];
-    CCHmacContext hmacContext;
-    CCHmacInit(&hmacContext, kCCHmacAlgSHA256, derivedHMACKey, kCCKeySizeAES256);
-    CCHmacUpdate(&hmacContext, [iv bytes], [iv length]);
-    CCHmacUpdate(&hmacContext, [encryptedMasterKeys bytes], [encryptedMasterKeys length]);
-    CCHmacFinal(&hmacContext, hmacSHA256);
-
-    free(derivedEncryptionKey);
-
-    // Concatenate header, salt, HMACSHA256, IV and encrypted master keys.
-    NSMutableData *ret = [NSMutableData data];
-    [ret appendBytes:HEADER length:strlen(HEADER)];
-    [ret appendData:salt];
-    [ret appendBytes:hmacSHA256 length:CC_SHA256_DIGEST_LENGTH];
-    [ret appendData:iv];
-    [ret appendData:encryptedMasterKeys];
-    
-    return ret;
-}
 - (BOOL)loadPrivateKeyFromData:(NSError **)error {
     if ([data length] < (strlen(HEADER) + SALT_LENGTH + CC_SHA256_DIGEST_LENGTH + IV_LENGTH + 1)) {
         SETNSERROR([self errorDomain], -1, @"not enough bytes in dat file");
@@ -406,7 +331,8 @@
     }
     
     // Decrypt master keys.
-    size_t theMasterKeysLen = kCCKeySizeAES256 * 2 + kCCBlockSizeAES128;
+    NSUInteger expectedKeysLen = (encryptionVersion == 3) ? (kCCKeySizeAES256 * 3) : (kCCKeySizeAES256 * 2);
+    size_t theMasterKeysLen = expectedKeysLen + kCCBlockSizeAES128;
     NSMutableData *theMasterKeys = [NSMutableData dataWithLength:theMasterKeysLen];
     size_t theMasterKeysActualLen = 0;
     const unsigned char *encryptedMasterKeys = bytes + strlen(HEADER) + SALT_LENGTH + CC_SHA256_DIGEST_LENGTH + IV_LENGTH;
@@ -433,6 +359,12 @@
 
     [masterKeys release];
     masterKeys = [theMasterKeys copy];
+    
+    if ([masterKeys length] != expectedKeysLen && encryptionVersion != 1) {
+        SETNSERROR([EncryptionDatFile errorDomain], -1, @"unexpected master keys length %ld (expected %ld)", [masterKeys length], expectedKeysLen);
+        return NO;
+    }
+    
     return YES;
 }
 
